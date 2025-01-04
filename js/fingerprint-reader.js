@@ -1,223 +1,78 @@
-// js/fingerprint-reader.js
-
 class FingerprintReader {
     constructor() {
-        // Device configuration
         this.config = {
             vendorId: 0x05ba,  // DigitalPersona vendor ID
-            productId: 0x000a, // U.are.U 4500 product ID
+            productId: 0x000a, // DigitalPersona product ID
         };
-        
+
         this.device = null;
-        this.interface = null;
         this.endpointIn = null;
         this.endpointOut = null;
     }
 
     async connect() {
+        if (!navigator.usb) {
+            throw new Error('WebUSB is not supported in this browser.');
+        }
+
         try {
-            // Request device
             this.device = await navigator.usb.requestDevice({
-                filters: [{
-                    vendorId: this.config.vendorId,
-                    productId: this.config.productId
-                }]
+                filters: [{ vendorId: this.config.vendorId, productId: this.config.productId }]
             });
 
-            // Open device
             await this.device.open();
-            
-            // Select configuration
-            if (this.device.configuration === null) {
+
+            if (!this.device.configuration) {
                 await this.device.selectConfiguration(1);
             }
 
-            // Get interface and endpoints
-            const interfaces = this.device.configuration.interfaces;
-            this.interface = interfaces[0];
-            
-            // Claim interface
-            await this.device.claimInterface(this.interface.interfaceNumber);
+            await this.device.claimInterface(0);
 
-            // Find the endpoints
-            const alternate = this.interface.alternate;
-            for (const endpoint of alternate.endpoints) {
-                if (endpoint.direction === 'in') {
-                    this.endpointIn = endpoint.endpointNumber;
-                } else if (endpoint.direction === 'out') {
-                    this.endpointOut = endpoint.endpointNumber;
-                }
+            const interfaceDescriptor = this.device.configuration.interfaces[0];
+            for (const endpoint of interfaceDescriptor.alternates[0].endpoints) {
+                if (endpoint.direction === 'in') this.endpointIn = endpoint.endpointNumber;
+                if (endpoint.direction === 'out') this.endpointOut = endpoint.endpointNumber;
             }
 
             if (!this.endpointIn || !this.endpointOut) {
-                throw new Error('Required endpoints not found');
+                throw new Error('Required endpoints not found on the device.');
             }
 
-            // Initialize protocol handler
-            this.protocol = new FingerprintProtocol(this.device, this.endpointIn, this.endpointOut);
-            await this.protocol.initialize();
-
-            return true;
+            console.log('Device connected successfully.');
         } catch (error) {
-            // Clean up if initialization fails
-            if (this.device) {
-                try {
-                    if (this.interface) {
-                        await this.device.releaseInterface(this.interface.interfaceNumber);
-                    }
-                    await this.device.close();
-                } catch (cleanupError) {
-                    console.error('Cleanup error:', cleanupError);
-                }
-            }
-            throw new Error(`Connection failed: ${error.message}`);
+            throw new Error(`Failed to connect: ${error.message}`);
         }
     }
 
     async disconnect() {
-        if (this.device) {
-            try {
-                if (this.interface) {
-                    await this.device.releaseInterface(this.interface.interfaceNumber);
-                }
-                await this.device.close();
-                this.device = null;
-                this.interface = null;
-                this.endpointIn = null;
-                this.endpointOut = null;
-                this.protocol = null;
-                return true;
-            } catch (error) {
-                throw new Error(`Disconnection failed: ${error.message}`);
-            }
+        if (!this.device) {
+            throw new Error('No device connected.');
+        }
+
+        try {
+            await this.device.releaseInterface(0);
+            await this.device.close();
+            this.device = null;
+            console.log('Device disconnected successfully.');
+        } catch (error) {
+            throw new Error(`Failed to disconnect: ${error.message}`);
         }
     }
 
     async capture() {
-        if (!this.device || !this.protocol) {
-            throw new Error('Device not connected');
+        if (!this.device) {
+            throw new Error('Device not connected.');
         }
 
         try {
-            return await this.protocol.captureImage();
+            const command = new Uint8Array([0x04]); // Replace with actual capture command
+            await this.device.transferOut(this.endpointOut, command);
+
+            const response = await this.device.transferIn(this.endpointIn, 512); // Adjust buffer size
+            return new Blob([response.data.buffer], { type: 'image/png' });
         } catch (error) {
-            throw new Error(`Capture failed: ${error.message}`);
+            throw new Error(`Failed to capture fingerprint: ${error.message}`);
         }
-    }
-
-    isConnected() {
-        return this.device !== null && this.protocol !== null;
-    }
-}
-
-class FingerprintProtocol {
-    constructor(device, endpointIn, endpointOut) {
-        this.device = device;
-        this.endpointIn = endpointIn;
-        this.endpointOut = endpointOut;
-        
-        this.commands = {
-            RESET: 0x01,
-            GET_STATUS: 0x02,
-            SET_PARAMS: 0x03,
-            CAPTURE: 0x04,
-            GET_IMAGE: 0x05
-        };
-    }
-
-    async initialize() {
-        try {
-            // Send reset command
-            await this._sendCommand(this.commands.RESET);
-            
-            // Wait for device to reset
-            await new Promise(resolve => setTimeout(resolve, 1000));
-            
-            // Set parameters
-            await this._setParameters();
-            return true;
-        } catch (error) {
-            throw new Error(`Initialization failed: ${error.message}`);
-        }
-    }
-
-    async captureImage() {
-        try {
-            // Start capture
-            await this._sendCommand(this.commands.CAPTURE);
-            
-            // Wait for finger detection
-            await this._waitForFinger();
-            
-            // Get image data
-            const imageData = await this._getImage();
-            
-            // Process and return image
-            return this._processImage(imageData);
-        } catch (error) {
-            throw new Error(`Image capture failed: ${error.message}`);
-        }
-    }
-
-    async _sendCommand(command, data = new Uint8Array([command])) {
-        try {
-            const result = await this.device.transferOut(this.endpointOut, data);
-            if (result.status !== 'ok') {
-                throw new Error(`Command transfer failed: ${result.status}`);
-            }
-            return true;
-        } catch (error) {
-            throw new Error(`Command failed: ${error.message}`);
-        }
-    }
-
-    async _getStatus() {
-        try {
-            const result = await this.device.transferIn(this.endpointIn, 64);
-            return new Uint8Array(result.data.buffer);
-        } catch (error) {
-            throw new Error(`Status read failed: ${error.message}`);
-        }
-    }
-
-    async _waitForFinger(timeout = 10000) {
-        const startTime = Date.now();
-        
-        while (Date.now() - startTime < timeout) {
-            const status = await this._getStatus();
-            if (status[0] & 0x01) {
-                return true;
-            }
-            await new Promise(resolve => setTimeout(resolve, 100));
-        }
-        
-        throw new Error('Timeout waiting for finger');
-    }
-
-    async _getImage() {
-        try {
-            const result = await this.device.transferIn(this.endpointIn, 150000);
-            return new Uint8Array(result.data.buffer);
-        } catch (error) {
-            throw new Error(`Image read failed: ${error.message}`);
-        }
-    }
-
-    _processImage(rawData) {
-        // Create a blob from the raw data
-        return new Blob([rawData], { type: 'image/bmp' });
-    }
-
-    async _setParameters() {
-        // Set device parameters (adjust based on your device)
-        const params = new Uint8Array([
-            this.commands.SET_PARAMS,
-            0x01, // Parameter 1
-            0x02, // Parameter 2
-            0x03  // Parameter 3
-        ]);
-        
-        await this._sendCommand(this.commands.SET_PARAMS, params);
     }
 }
 
