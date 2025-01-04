@@ -6,15 +6,12 @@ class FingerprintReader {
         this.config = {
             vendorId: 0x05ba,  // DigitalPersona vendor ID
             productId: 0x000a, // U.are.U 4500 product ID
-            interfaceNumber: 0,
-            endpoints: {
-                in: 1,
-                out: 2
-            }
         };
         
         this.device = null;
-        this.protocol = null;
+        this.interface = null;
+        this.endpointIn = null;
+        this.endpointOut = null;
     }
 
     async connect() {
@@ -27,17 +24,52 @@ class FingerprintReader {
                 }]
             });
 
-            // Open device and select configuration
+            // Open device
             await this.device.open();
-            await this.device.selectConfiguration(1);
-            await this.device.claimInterface(this.config.interfaceNumber);
+            
+            // Select configuration
+            if (this.device.configuration === null) {
+                await this.device.selectConfiguration(1);
+            }
+
+            // Get interface and endpoints
+            const interfaces = this.device.configuration.interfaces;
+            this.interface = interfaces[0];
+            
+            // Claim interface
+            await this.device.claimInterface(this.interface.interfaceNumber);
+
+            // Find the endpoints
+            const alternate = this.interface.alternate;
+            for (const endpoint of alternate.endpoints) {
+                if (endpoint.direction === 'in') {
+                    this.endpointIn = endpoint.endpointNumber;
+                } else if (endpoint.direction === 'out') {
+                    this.endpointOut = endpoint.endpointNumber;
+                }
+            }
+
+            if (!this.endpointIn || !this.endpointOut) {
+                throw new Error('Required endpoints not found');
+            }
 
             // Initialize protocol handler
-            this.protocol = new FingerprintProtocol(this.device);
+            this.protocol = new FingerprintProtocol(this.device, this.endpointIn, this.endpointOut);
             await this.protocol.initialize();
 
             return true;
         } catch (error) {
+            // Clean up if initialization fails
+            if (this.device) {
+                try {
+                    if (this.interface) {
+                        await this.device.releaseInterface(this.interface.interfaceNumber);
+                    }
+                    await this.device.close();
+                } catch (cleanupError) {
+                    console.error('Cleanup error:', cleanupError);
+                }
+            }
             throw new Error(`Connection failed: ${error.message}`);
         }
     }
@@ -45,8 +77,14 @@ class FingerprintReader {
     async disconnect() {
         if (this.device) {
             try {
+                if (this.interface) {
+                    await this.device.releaseInterface(this.interface.interfaceNumber);
+                }
                 await this.device.close();
                 this.device = null;
+                this.interface = null;
+                this.endpointIn = null;
+                this.endpointOut = null;
                 this.protocol = null;
                 return true;
             } catch (error) {
@@ -73,8 +111,11 @@ class FingerprintReader {
 }
 
 class FingerprintProtocol {
-    constructor(device) {
+    constructor(device, endpointIn, endpointOut) {
         this.device = device;
+        this.endpointIn = endpointIn;
+        this.endpointOut = endpointOut;
+        
         this.commands = {
             RESET: 0x01,
             GET_STATUS: 0x02,
@@ -86,7 +127,13 @@ class FingerprintProtocol {
 
     async initialize() {
         try {
+            // Send reset command
             await this._sendCommand(this.commands.RESET);
+            
+            // Wait for device to reset
+            await new Promise(resolve => setTimeout(resolve, 1000));
+            
+            // Set parameters
             await this._setParameters();
             return true;
         } catch (error) {
@@ -112,9 +159,12 @@ class FingerprintProtocol {
         }
     }
 
-    async _sendCommand(command, data = new Uint8Array(0)) {
+    async _sendCommand(command, data = new Uint8Array([command])) {
         try {
-            await this.device.transferOut(1, data);
+            const result = await this.device.transferOut(this.endpointOut, data);
+            if (result.status !== 'ok') {
+                throw new Error(`Command transfer failed: ${result.status}`);
+            }
             return true;
         } catch (error) {
             throw new Error(`Command failed: ${error.message}`);
@@ -123,7 +173,7 @@ class FingerprintProtocol {
 
     async _getStatus() {
         try {
-            const result = await this.device.transferIn(1, 64);
+            const result = await this.device.transferIn(this.endpointIn, 64);
             return new Uint8Array(result.data.buffer);
         } catch (error) {
             throw new Error(`Status read failed: ${error.message}`);
@@ -146,7 +196,7 @@ class FingerprintProtocol {
 
     async _getImage() {
         try {
-            const result = await this.device.transferIn(1, 150000); // Adjust size based on your device
+            const result = await this.device.transferIn(this.endpointIn, 150000);
             return new Uint8Array(result.data.buffer);
         } catch (error) {
             throw new Error(`Image read failed: ${error.message}`);
@@ -161,6 +211,7 @@ class FingerprintProtocol {
     async _setParameters() {
         // Set device parameters (adjust based on your device)
         const params = new Uint8Array([
+            this.commands.SET_PARAMS,
             0x01, // Parameter 1
             0x02, // Parameter 2
             0x03  // Parameter 3
